@@ -147,7 +147,6 @@ The repository includes placeholder result tables in `RESULTS.md` for:
 - Zhang, Y. et al. (2023). PINN formulations for biomechanical system approximation.
 - Chen, R. T. Q. et al. (2018). Neural ODEs.
 - Xia, T. and Frey Law, L. A. (2008). Three-compartment muscle fatigue model.
-
 ```
 
 ## License
