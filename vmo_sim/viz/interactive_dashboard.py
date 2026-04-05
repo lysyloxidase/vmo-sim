@@ -16,7 +16,9 @@ import torch
 from vmo_sim.analysis.sensitivity import MuscleSensitivityAnalysis
 from vmo_sim.analysis.validation import ModelValidation
 from vmo_sim.biomechanics.hill_muscle import HillMuscle
-from vmo_sim.biomechanics.parameters import VMOParameters
+from vmo_sim.biomechanics.parameters import VMOParameters, get_default_quadriceps
+from vmo_sim.biomechanics.patellofemoral import PatellofemoralModel
+from vmo_sim.biomechanics.quadriceps import QuadricepsModel
 from vmo_sim.ml.neural_ode import MuscleNeuralODE
 from vmo_sim.ml.pinn_surrogate import VMOPINNSurrogate
 from vmo_sim.ml.surrogate_trainer import SurrogateTrainer
@@ -257,6 +259,85 @@ def _analysis_snapshot(
     return sensitivity_frame, comparison
 
 
+def _fast_output_value(output_variable: str, params: VMOParameters) -> float:
+    hill = HillMuscle(params)
+    if output_variable == "peak_force":
+        return float(
+            hill.compute_force(
+                activation=torch.tensor(1.0),
+                normalized_fiber_length=torch.tensor(1.0),
+                normalized_fiber_velocity=torch.tensor(0.0),
+            ).item()
+        )
+    if output_variable == "time_to_peak":
+        return float(3.0 * params.activation_time_constant)
+
+    quadriceps_params = get_default_quadriceps()
+    quadriceps_params["VMO"] = params
+    quadriceps = QuadricepsModel(params=quadriceps_params)
+    forces, _ = quadriceps(
+        {
+            "VMO": torch.tensor(0.7),
+            "VML": torch.tensor(0.6),
+            "VL": torch.tensor(0.7),
+            "RF": torch.tensor(0.25),
+            "VI": torch.tensor(0.30),
+        },
+        torch.tensor(0.8),
+        torch.tensor(0.0),
+        dt=0.001,
+    )
+    if output_variable == "vmo_vl_ratio":
+        return float(forces["vmo_vl_ratio"].item())
+    if output_variable == "patellar_displacement":
+        patellofemoral = PatellofemoralModel()
+        return float(
+            patellofemoral.patellar_displacement(
+                forces["mediolateral_force"],
+                torch.tensor(0.8),
+            ).item()
+        )
+    if output_variable == "fatigue_rate":
+        return float(params.fatigue_rate)
+    raise ValueError(f"Unsupported output_variable: {output_variable}")
+
+
+def _fast_sensitivity_frame(
+    output_variable: str,
+    perturbation_fraction: float = 0.1,
+) -> pd.DataFrame:
+    analysis = MuscleSensitivityAnalysis()
+    nominal = analysis.nominal_params
+    baseline = _fast_output_value(output_variable, nominal)
+    epsilon = max(abs(baseline), 1e-6)
+    scores: list[float] = []
+
+    for parameter_name in analysis.PARAMETER_NAMES:
+        nominal_value = float(getattr(nominal, parameter_name))
+        delta = max(abs(nominal_value) * perturbation_fraction, 1e-6)
+        plus_params = nominal.model_copy(update={parameter_name: nominal_value + delta})
+        minus_params = nominal.model_copy(
+            update={parameter_name: max(1e-6, nominal_value - delta)}
+        )
+        plus_value = _fast_output_value(output_variable, plus_params)
+        minus_value = _fast_output_value(output_variable, minus_params)
+        scores.append(abs(plus_value - minus_value) / (2.0 * epsilon))
+
+    weights = np.asarray(scores, dtype=np.float64)
+    if np.allclose(weights.sum(), 0.0):
+        weights = np.full_like(weights, 1.0 / float(len(weights)))
+    else:
+        weights = weights / weights.sum()
+
+    return pd.DataFrame(
+        {
+            "parameter": analysis.PARAMETER_NAMES,
+            "S1": weights,
+            "ST": weights,
+        }
+    )
+
+
 @st.cache_data(show_spinner=False)
 def _cached_analysis_snapshot(
     n_samples: int,
@@ -265,6 +346,41 @@ def _cached_analysis_snapshot(
     sensitivity_frame, comparison_frame = _analysis_snapshot(
         n_samples=n_samples,
         output_variable=output_variable,
+    )
+    validation = ModelValidation()
+    validation_frame = pd.DataFrame.from_records(
+        [
+            validation.validate_isometric_force(),
+            validation.validate_activation_timing(),
+            validation.validate_patellar_tracking(),
+        ]
+    )
+    return (
+        sensitivity_frame,
+        comparison_frame,
+        validation_frame,
+        validation.generate_validation_report(),
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_fast_analysis_snapshot(
+    output_variable: str,
+    perturbation_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    sensitivity_frame = _fast_sensitivity_frame(
+        output_variable=output_variable,
+        perturbation_fraction=perturbation_fraction,
+    )
+    params = VMOParameters()
+    hill = HillMuscle(params)
+    pinn = VMOPINNSurrogate(muscle_params=params)
+    node = MuscleNeuralODE(muscle_params=params)
+    comparison_frame = SurrogateTrainer.compare_models(
+        hill,
+        pinn,
+        node,
+        test_conditions={},
     )
     validation = ModelValidation()
     validation_frame = pd.DataFrame.from_records(
@@ -570,6 +686,11 @@ def build_dashboard() -> None:
             st.info("Click `Run RL replay` to generate policy visualizations.")
 
     with tab_analysis:
+        analysis_mode = st.radio(
+            "Analysis mode",
+            ["Fast preview", "Full Sobol (slow)"],
+            horizontal=True,
+        )
         output_variable = st.selectbox(
             "Sobol output variable",
             [
@@ -580,31 +701,65 @@ def build_dashboard() -> None:
                 "fatigue_rate",
             ],
         )
-        n_samples = st.slider(
-            "Sobol base sample count",
-            min_value=16,
-            max_value=256,
-            value=32,
-            step=16,
-        )
-        analysis_request = {
-            "output_variable": output_variable,
-            "n_samples": n_samples,
-        }
+        if analysis_mode == "Fast preview":
+            perturbation_percent = st.slider(
+                "Local perturbation (%)",
+                min_value=5,
+                max_value=30,
+                value=10,
+                step=5,
+            )
+            analysis_request: dict[str, object] = {
+                "mode": analysis_mode,
+                "output_variable": output_variable,
+                "perturbation_percent": perturbation_percent,
+            }
+        else:
+            n_samples = st.slider(
+                "Sobol base sample count",
+                min_value=4,
+                max_value=64,
+                value=8,
+                step=4,
+            )
+            st.warning(
+                "Full Sobol is accurate but slow here. Expect minutes, not seconds."
+            )
+            analysis_request = {
+                "mode": analysis_mode,
+                "output_variable": output_variable,
+                "n_samples": n_samples,
+            }
         run_analysis = st.button("Run analysis snapshot", key="analysis_snapshot")
         analysis_payload = st.session_state.get("analysis_payload")
 
         if run_analysis:
-            with st.spinner("Running sensitivity and validation analysis..."):
-                (
-                    sensitivity_frame,
-                    comparison_frame,
-                    validation_frame,
-                    validation_report,
-                ) = _cached_analysis_snapshot(
-                    n_samples=n_samples,
-                    output_variable=output_variable,
-                )
+            spinner_text = (
+                "Running fast analysis preview..."
+                if analysis_mode == "Fast preview"
+                else "Running full Sobol sensitivity and validation analysis..."
+            )
+            with st.spinner(spinner_text):
+                if analysis_mode == "Fast preview":
+                    (
+                        sensitivity_frame,
+                        comparison_frame,
+                        validation_frame,
+                        validation_report,
+                    ) = _cached_fast_analysis_snapshot(
+                        output_variable=output_variable,
+                        perturbation_fraction=perturbation_percent / 100.0,
+                    )
+                else:
+                    (
+                        sensitivity_frame,
+                        comparison_frame,
+                        validation_frame,
+                        validation_report,
+                    ) = _cached_analysis_snapshot(
+                        n_samples=n_samples,
+                        output_variable=output_variable,
+                    )
             st.session_state["analysis_payload"] = {
                 "request": analysis_request,
                 "sensitivity_frame": sensitivity_frame,
@@ -635,7 +790,7 @@ def build_dashboard() -> None:
             st.markdown(validation_report)
         else:
             st.info(
-                "Click `Run analysis snapshot` to generate Sobol indices and validation tables."
+                "Fast preview returns in seconds. Full Sobol is available when you need the slow, more faithful analysis."
             )
 
 
