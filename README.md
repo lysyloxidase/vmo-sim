@@ -148,15 +148,6 @@ The repository includes placeholder result tables in `RESULTS.md` for:
 - Chen, R. T. Q. et al. (2018). Neural ODEs.
 - Xia, T. and Frey Law, L. A. (2008). Three-compartment muscle fatigue model.
 
-## Citation
-
-```bibtex
-@software{vmo_sim_2026,
-  title   = {VMO-Sim},
-  author  = {Your Name or Lab},
-  year    = {2026},
-  note    = {BibTeX placeholder. Replace with project DOI or repository citation.}
-}
 ```
 
 ## License
