@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Iterable
+from typing import Iterable, cast
 
 import torch
 
@@ -149,14 +149,18 @@ def main() -> int:
             total_timesteps=rl_timesteps, log_dir="results/demo_rl"
         )
         eval_metrics = rl_trainer.evaluate(n_episodes=5)
+        mean_reward = cast(float, eval_metrics["mean_reward"])
+        mean_max_lateral_displacement = cast(
+            float, eval_metrics["mean_max_lateral_displacement"]
+        )
         _rows(
             [
                 ("Timesteps", rl_timesteps),
                 ("Backend", train_metrics["backend"]),
-                ("Mean reward", f"{float(eval_metrics['mean_reward']):.3f}"),
+                ("Mean reward", f"{mean_reward:.3f}"),
                 (
                     "Mean max lateral displacement",
-                    f"{1000.0 * float(eval_metrics['mean_max_lateral_displacement']):.3f} mm",
+                    f"{1000.0 * mean_max_lateral_displacement:.3f} mm",
                 ),
             ]
         )

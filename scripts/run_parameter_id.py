@@ -43,7 +43,7 @@ def main() -> int:
         }
     )
     identifier = GradientParameterIdentification()
-    target_force = identifier._simulate_force(  # type: ignore[attr-defined]
+    target_force = identifier._simulate_force(
         experimental_emg,
         musculotendon_lengths,
         {
